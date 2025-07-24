@@ -1,0 +1,41 @@
+# Core dependencies
+python-dotenv
+pydantic
+joblib
+numpy
+scikit-learn
+langgraph
+
+# Kafka
+confluent-kafka
+
+# MongoDB
+pymongo
+
+# For MongoDB Atlas Vector Search fallback
+scipy
+
+# Logging and utility (already part of stdlib, but keep if needed)
+loguru
+
+# Jupyter (for Codespaces notebook support)
+ipykernel
+notebook
+
+# Optional: If you're using HuggingFace-style sentence transformers for vector embedding
+sentence-transformers
+
+# If you ever add API serving or interactive demos
+fastapi
+uvicorn
+
+# Linting/formatting tools for devcontainer (if paths are configured)
+black
+flake8
+mypy
+pylint
+bandit
+yapf
+autopep8
+pycodestyle
+pydocstyle
