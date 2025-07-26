@@ -4,13 +4,13 @@ from langchain.chat_models import ChatOpenAI
 from sentence_transformers import SentenceTransformer
 from pymongo import MongoClient
 from transaction import Transaction
-from fraud_signature_service import FraudSignatureService
+from services.fraud_signature_service import FraudSignatureService
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 import json
 import logging
 import asyncio
-from settings import settings
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -86,15 +86,15 @@ async def similarity_search(state: WorkflowState) -> WorkflowState:
         def encode():
             return encoder.encode([" ".join(signatures)])[0]
 
-        vector = await loop.run_in_executor(None, encode)
+        embedding = await loop.run_in_executor(None, encode)
 
         def search():
             db = get_db()
             return list(db[settings.MONGODB_COLLECTION_SIGNATURES].aggregate([
                 {"$vectorSearch": {
                     "index": settings.VECTOR_INDEX_NAME,
-                    "path": "vector",
-                    "queryVector": vector,
+                    "path": "embedding",
+                    "queryVector": embedding,
                     "numCandidates": 50,
                     "limit": 5,
                 }}
@@ -108,7 +108,7 @@ async def similarity_search(state: WorkflowState) -> WorkflowState:
             db[settings.MONGODB_COLLECTION_SIGNATURES].insert_one({
                 "transaction_id": state.transaction["transaction_id"],
                 "signatures": signatures,
-                "vector": vector
+                "embedding": embedding
             })
 
         if state.fraud_analysis and state.fraud_analysis.get("is_fraud"):

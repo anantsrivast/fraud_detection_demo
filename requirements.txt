@@ -39,3 +39,9 @@ yapf
 autopep8
 pycodestyle
 pydocstyle
+
+#others
+langchain
+pydantic
+sentence_transformers
+langgraph
