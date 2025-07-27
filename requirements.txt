@@ -45,3 +45,4 @@ langchain
 pydantic
 sentence_transformers
 langgraph
+langchain-community

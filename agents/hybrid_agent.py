@@ -1,23 +1,35 @@
 from langchain.agents import tool
 from langgraph.graph import StateGraph, END
-from langchain.chat_models import ChatOpenAI
+from langchain_community.chat_models import ChatOpenAI  # Updated import
 from sentence_transformers import SentenceTransformer
 from pymongo import MongoClient
-from transaction import Transaction
+from models.transaction import Transaction
 from services.fraud_signature_service import FraudSignatureService
 from typing import Dict, Any, List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 import json
 import logging
 import asyncio
-from config.settings import settings
+from config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
 # -------------------- State Definition --------------------
 
 class WorkflowState(BaseModel):
-    transaction: Dict[str, Any]
+    """
+    Represents the state passed between nodes in the LangGraph workflow.
+
+    Attributes:
+        transaction: The incoming transaction data.
+        duplicate_check: Output of duplicate detection step.
+        fraud_analysis: Output of fraud classification.
+        similarity_data: Output of vector similarity search.
+        recommendation: LLM-generated action recommendation.
+        storage_status: Result of storing the transaction.
+        errors: List of error messages collected during processing.
+    """
+    transaction: Transaction
     duplicate_check: Optional[Dict[str, Any]] = None
     fraud_analysis: Optional[Dict[str, Any]] = None
     similarity_data: Optional[Dict[str, Any]] = None
@@ -25,24 +37,39 @@ class WorkflowState(BaseModel):
     storage_status: Optional[str] = None
     errors: List[str] = []
 
-# -------------------- Tool Implementations --------------------
+    @model_validator(mode="before")
+    @classmethod
+    def convert_transaction_if_needed(cls, values):
+        txn = values.get("transaction")
+        if isinstance(txn, dict):
+            values["transaction"] = Transaction(**txn)
+        return values
+
+# ---------------- Mongo ----------------
 
 def get_db():
-    client = MongoClient(settings.MONGODB_URI)
-    return client[settings.MONGODB_DATABASE]
+    """
+    Establishes and returns a MongoDB database connection.
+    """
+    client = MongoClient(Settings.MONGODB_URI)
+    return client[Settings.MONGODB_DATABASE]
 
-@tool
+# ---------------- Tool Definitions ----------------
+
 async def duplicate_check(state: WorkflowState) -> WorkflowState:
+ 
+    """
+    Checks if the transaction is a duplicate by querying MongoDB.
+    Adds a recommendation to skip or continue based on match.
+    """
     try:
-        transaction_data = state.transaction
-        if not transaction_data:
-            raise ValueError("No transaction data provided")
-
-        transaction = Transaction(**transaction_data)
+        transaction = state.transaction
 
         def check_duplicate():
             db = get_db()
-            return db[settings.MONGODB_COLLECTION_CASES].count_documents({"transaction_id": transaction.transaction_id}) > 0
+            return db[Settings.MONGODB_COLLECTION_CASES].count_documents(
+                {"transaction_id": transaction.transaction_id}
+            ) > 0
 
         loop = asyncio.get_event_loop()
         is_duplicate = await loop.run_in_executor(None, check_duplicate)
@@ -51,37 +78,45 @@ async def duplicate_check(state: WorkflowState) -> WorkflowState:
             "is_duplicate": is_duplicate,
             "customer_id": transaction.customer_id,
             "transaction_id": transaction.transaction_id,
-            "checked_at": loop.time()
+            "checked_at": loop.time(),
+            "recommendation": "SKIP_PROCESSING" if is_duplicate else "CONTINUE_PROCESSING"
         }
 
         if is_duplicate:
-            result["recommendation"] = "SKIP_PROCESSING"
             result["reason"] = "Duplicate complaint detected within 24 hours"
-        else:
-            result["recommendation"] = "CONTINUE_PROCESSING"
 
-        logger.info(f"Duplicate check completed for {transaction.transaction_id}: {is_duplicate}")
         state.duplicate_check = result
+        logger.info(f"Duplicate check completed for {transaction.transaction_id}: {is_duplicate}")
+
     except Exception as e:
         state.errors.append(f"duplicate_check error: {str(e)}")
+
     return state
 
-@tool
+
 async def fraud_classification(state: WorkflowState) -> WorkflowState:
+    """
+    Applies a simple rule-based fraud check based on transaction amount.
+    Flags transaction as fraudulent if amount > 1000.
+    """
     try:
-        amt = state.transaction.get("amount", 0)
+        amt = state.transaction.amount or 0
         state.fraud_analysis = {"is_fraud": amt > 1000}
     except Exception as e:
         state.errors.append(f"fraud_classification error: {str(e)}")
     return state
 
-@tool
+
 async def similarity_search(state: WorkflowState) -> WorkflowState:
+    """
+    Encodes transaction fraud signatures and searches for similar cases
+    using MongoDB vector search. Optionally stores the embedding.
+    """
     try:
         loop = asyncio.get_event_loop()
-        encoder = SentenceTransformer(settings.EMBEDDING_MODEL)
+        encoder = SentenceTransformer(Settings.EMBEDDING_MODEL)
         fs = FraudSignatureService()
-        signatures = fs.generate_fraud_signatures(Transaction(**state.transaction))
+        signatures = fs.generate_fraud_signatures(state.transaction)
 
         def encode():
             return encoder.encode([" ".join(signatures)])[0]
@@ -90,9 +125,9 @@ async def similarity_search(state: WorkflowState) -> WorkflowState:
 
         def search():
             db = get_db()
-            return list(db[settings.MONGODB_COLLECTION_SIGNATURES].aggregate([
+            return list(db[Settings.MONGODB_COLLECTION_SIGNATURES].aggregate([
                 {"$vectorSearch": {
-                    "index": settings.VECTOR_INDEX_NAME,
+                    "index": Settings.VECTOR_INDEX_NAME,
                     "path": "embedding",
                     "queryVector": embedding,
                     "numCandidates": 50,
@@ -105,8 +140,8 @@ async def similarity_search(state: WorkflowState) -> WorkflowState:
 
         def insert_signature():
             db = get_db()
-            db[settings.MONGODB_COLLECTION_SIGNATURES].insert_one({
-                "transaction_id": state.transaction["transaction_id"],
+            db[Settings.MONGODB_COLLECTION_SIGNATURES].insert_one({
+                "transaction_id": state.transaction.transaction_id,
                 "signatures": signatures,
                 "embedding": embedding
             })
@@ -118,8 +153,12 @@ async def similarity_search(state: WorkflowState) -> WorkflowState:
         state.errors.append(f"similarity_search error: {str(e)}")
     return state
 
-@tool
+
 async def action_recommendation(state: WorkflowState) -> WorkflowState:
+    """
+    Invokes an LLM to generate an action recommendation for the fraud response team
+    based on previous analysis and similarity search results.
+    """
     try:
         llm = ChatOpenAI(model="gpt-4", temperature=0)
         context = f"Fraud: {state.fraud_analysis}\nSimilar: {state.similarity_data}"
@@ -129,12 +168,15 @@ async def action_recommendation(state: WorkflowState) -> WorkflowState:
         state.errors.append(f"action_recommendation error: {str(e)}")
     return state
 
-@tool
+
 async def store_transaction(state: WorkflowState) -> WorkflowState:
+    """
+    Persists the transaction to MongoDB for audit or review purposes.
+    """
     try:
         def store():
             db = get_db()
-            db[settings.MONGODB_COLLECTION_CASES].insert_one(state.transaction)
+            db[Settings.MONGODB_COLLECTION_CASES].insert_one(state.transaction.dict())
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, store)
@@ -146,6 +188,12 @@ async def store_transaction(state: WorkflowState) -> WorkflowState:
 # -------------------- LangGraph Definition --------------------
 
 def build_workflow():
+    """
+    Constructs and compiles the LangGraph workflow with logic for fraud analysis.
+
+    Returns:
+        A compiled graph ready to invoke with WorkflowState.
+    """
     workflow = StateGraph(WorkflowState)
     workflow.add_node("duplicate", duplicate_check)
     workflow.add_node("classify", fraud_classification)
@@ -173,8 +221,11 @@ def build_workflow():
 # -------------------- Execution --------------------
 
 if __name__ == "__main__":
+    """
+    Executes the compiled workflow on the first 5 transactions in the input JSON file.
+    """
     compiled = build_workflow()
-    with open("merged_transactions_array.json") as f:
+    with open("merged_transactions.json") as f:
         txns = json.load(f)
 
     async def run():
