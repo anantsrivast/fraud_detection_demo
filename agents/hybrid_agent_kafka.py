@@ -128,7 +128,9 @@ async def agent_reflection(state: WorkflowState) -> WorkflowState:
 
         What patterns stand out? What initial actions would you take and why?
         """
-        state.agent_reflection = await llm.ainvoke(prompt)
+        response = await llm.ainvoke(prompt)
+        state.agent_reflection = str(response.content if hasattr(response, "content") else response)
+
     except Exception as e:
         state.errors.append(f"agent_reflection error: {str(e)}")
     return state
@@ -144,7 +146,9 @@ async def action_recommendation(state: WorkflowState) -> WorkflowState:
         What should the fraud response team do?
         Explain your reasoning step-by-step before making a recommendation.
         """
-        state.recommendation = await llm.ainvoke(prompt)
+        response = await llm.ainvoke(prompt)
+        state.recommendation = str(response.content if hasattr(response, "content") else response)
+
     except Exception as e:
         state.errors.append(f"action_recommendation error: {str(e)}")
     return state
@@ -180,8 +184,8 @@ def build_workflow():
     )
     workflow.add_conditional_edges(
         "classify",
-        lambda s: "similarity" if s.fraud_analysis and s.fraud_analysis.get("is_fraud") else "store",
-        {"similarity": "similarity", "store": "store"}
+        lambda s: "similarity" if s.fraud_analysis and s.fraud_analysis.get("is_fraud") else "skip",
+        {"similarity": "similarity", "skip": END}
     )
     workflow.add_edge("similarity", "reflect")
     workflow.add_edge("reflect", "recommend")
