@@ -26,7 +26,7 @@ class CloudKafkaService:
             'sasl.username': settings.KAFKA_API_KEY,
             'sasl.password': settings.KAFKA_API_SECRET,
             'group.id': settings.KAFKA_CONSUMER_GROUP,
-            'auto.offset.reset': 'latest',
+            'auto.offset.reset': 'beginning',
             'enable.auto.commit': True,
         }
         
