@@ -117,14 +117,14 @@ class CloudSetup:
             consumer = Consumer(consumer_config)
             
             # Test producer
-            producer.produce(settings.KAFKA_TOPIC, "test message")
-            producer.flush()
+            # producer.produce(settings.KAFKA_TOPIC, "test message")
+            # producer.flush()
             
             # Test consumer
-            consumer.subscribe([settings.KAFKA_TOPIC])
-            msg = consumer.poll(timeout=10)
+            # consumer.subscribe([settings.KAFKA_TOPIC])
+            # msg = consumer.poll(timeout=10)
             
-            logger.info("Confluent Cloud Kafka connection successful")
+            # logger.info("Confluent Cloud Kafka connection successful")
             
             # Topic creation is typically handled through Confluent Cloud UI or CLI
             logger.info(f"Ensure topic '{settings.KAFKA_TOPIC}' exists in Confluent Cloud")
