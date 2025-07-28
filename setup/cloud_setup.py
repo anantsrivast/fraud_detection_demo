@@ -12,6 +12,7 @@ class CloudSetup:
     def __init__(self):
         self.mongodb_client = None
         self.kafka_producer = None
+        self.kafka_consumer = None  
     
     def setup_mongodb_atlas(self) -> bool:
         """Setup MongoDB Atlas collections and indexes"""
@@ -100,10 +101,28 @@ class CloudSetup:
                 'sasl.username': settings.KAFKA_API_KEY,
                 'sasl.password': settings.KAFKA_API_SECRET,
             }
+            consumer_config = {
+                'bootstrap.servers': settings.KAFKA_BOOTSTRAP_SERVERS,
+                'sasl.mechanisms': 'PLAIN',
+                'security.protocol': 'SASL_SSL',
+                'sasl.username': settings.KAFKA_API_KEY,
+                'sasl.password': settings.KAFKA_API_SECRET,
+            }   
             
             # Create test producer
             from confluent_kafka import Producer
             producer = Producer(producer_config)
+
+            from confluent_kafka import Consumer
+            consumer = Consumer(consumer_config)
+            
+            # Test producer
+            producer.produce(settings.KAFKA_TOPIC, "test message")
+            producer.flush()
+            
+            # Test consumer
+            consumer.subscribe([settings.KAFKA_TOPIC])
+            msg = consumer.poll(timeout=10)
             
             logger.info("Confluent Cloud Kafka connection successful")
             
