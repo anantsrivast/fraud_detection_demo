@@ -116,11 +116,11 @@ class CloudSetup:
             from confluent_kafka import Consumer
             consumer = Consumer(consumer_config)
             
-            # Test producer
+            # # Test producer
             # producer.produce(settings.KAFKA_TOPIC, "test message")
             # producer.flush()
             
-            # Test consumer
+            # # Test consumer
             # consumer.subscribe([settings.KAFKA_TOPIC])
             # msg = consumer.poll(timeout=10)
             

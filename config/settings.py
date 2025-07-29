@@ -11,8 +11,14 @@ class Settings:
     KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
     KAFKA_API_KEY = os.getenv("KAFKA_API_KEY")
     KAFKA_API_SECRET = os.getenv("KAFKA_API_SECRET")
-    KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "fraud-transactions")
+    KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "fraudulent-transactions")
     KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "fraud-detection-agents")
+    
+    # Schema Registry Configuration
+    SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL")
+    SCHEMA_REGISTRY_API_KEY = os.getenv("SCHEMA_REGISTRY_API_KEY")
+    SCHEMA_REGISTRY_API_SECRET = os.getenv("SCHEMA_REGISTRY_API_SECRET")
+    SCHEMA_REGISTRY_SUBJECT = os.getenv("SCHEMA_REGISTRY_SUBJECT", "fraudulent-transactions-value")
     
     # MongoDB Atlas Configuration
     MONGODB_URI = os.getenv("MONGODB_URI")

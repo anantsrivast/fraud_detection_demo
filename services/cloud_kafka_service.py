@@ -1,4 +1,6 @@
 from confluent_kafka import Producer, Consumer, KafkaException
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.json_schema import JSONSerializer, JSONDeserializer
 import json
 import logging
 from typing import Callable, Optional, Dict, Any
@@ -30,8 +32,17 @@ class CloudKafkaService:
             'enable.auto.commit': True,
         }
         
+        # Schema Registry configuration
+        self.schema_registry_config = {
+            'url': settings.SCHEMA_REGISTRY_URL,
+            'basic.auth.user.info': f"{settings.SCHEMA_REGISTRY_API_KEY}:{settings.SCHEMA_REGISTRY_API_SECRET}"
+        }
+        
         self.producer: Optional[Producer] = None
         self.consumer: Optional[Consumer] = None
+        self.schema_registry_client: Optional[SchemaRegistryClient] = None
+        self.json_serializer: Optional[JSONSerializer] = None
+        self.json_deserializer: Optional[JSONDeserializer] = None
     
     def create_producer(self) -> Producer:
         """Create Confluent Kafka producer"""
@@ -54,13 +65,67 @@ class CloudKafkaService:
             logger.error(f"Failed to create Confluent Kafka consumer: {e}")
             raise
     
+    def setup_schema_registry(self):
+        """Setup Schema Registry client and serializers"""
+        try:
+            if not settings.SCHEMA_REGISTRY_URL:
+                logger.warning("Schema Registry URL not configured, using plain JSON")
+                return
+            
+            self.schema_registry_client = SchemaRegistryClient(self.schema_registry_config)
+            
+            # Test Schema Registry connection
+            try:
+                subjects = self.schema_registry_client.get_subjects()
+                logger.info(f"Schema Registry connection successful - found {len(subjects)} subjects")
+            except Exception as e:
+                logger.error(f"Schema Registry connection test failed: {e}")
+                raise
+            
+            # Create JSON serializer for producing
+            self.json_serializer = JSONSerializer(
+                self.schema_registry_client,
+                settings.SCHEMA_REGISTRY_SUBJECT
+            )
+            
+            # Create JSON deserializer for consuming
+            # For deserialization, we don't specify a subject - it auto-detects from the message
+            # The from_dict parameter tells it how to convert the parsed JSON back to Python objects
+            self.json_deserializer = JSONDeserializer(
+                self.schema_registry_client,
+                from_dict=lambda obj, ctx: obj,
+                to_dict=lambda obj, ctx: obj
+            )
+            
+            logger.info("Schema Registry setup completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup Schema Registry: {e}")
+            # Fall back to plain JSON
+            self.schema_registry_client = None
+            self.json_serializer = None
+            self.json_deserializer = None
+    
     def publish_transaction(self, transaction: Transaction) -> bool:
-        """Publish transaction to Confluent Kafka topic"""
+        """Publish transaction to Confluent Kafka topic with Schema Registry"""
         try:
             if not self.producer:
                 self.create_producer()
             
-            transaction_data = json.dumps(transaction.model_dump(default=str))
+            # Setup schema registry if not already done
+            if not self.schema_registry_client:
+                self.setup_schema_registry()
+            
+            # Prepare transaction data
+            transaction_dict = transaction.model_dump(default=str)
+            
+            # Use schema registry serializer if available, otherwise plain JSON
+            if self.json_serializer:
+                serialized_data = self.json_serializer(transaction_dict, None)
+                logger.info("Published transaction using Schema Registry")
+            else:
+                serialized_data = json.dumps(transaction_dict).encode('utf-8')
+                logger.info("Published transaction using plain JSON")
             
             def delivery_report(err, msg):
                 if err is not None:
@@ -71,7 +136,7 @@ class CloudKafkaService:
             self.producer.produce(
                 settings.KAFKA_TOPIC,
                 key=transaction.transaction_id,
-                value=transaction_data,
+                value=serialized_data,
                 callback=delivery_report
             )
             
@@ -84,10 +149,14 @@ class CloudKafkaService:
             return False
     
     def consume_transactions(self, callback: Callable[[Transaction], None]):
-        """Consume transactions from Confluent Kafka topic"""
+        """Consume transactions from Confluent Kafka topic with Schema Registry"""
         try:
             if not self.consumer:
                 self.create_consumer()
+            
+            # Setup schema registry if not already done
+            if not self.schema_registry_client:
+                self.setup_schema_registry()
             
             logger.info(f"Starting to consume transactions from topic: {settings.KAFKA_TOPIC}")
             
@@ -102,9 +171,40 @@ class CloudKafkaService:
                         logger.error(f"Consumer error: {msg.error()}")
                         continue
                     
-                    # Parse message
-                    transaction_data = json.loads(msg.value().decode('utf-8'))
-                    transaction = Transaction(**transaction_data)
+                    # Parse message - try manual Schema Registry parsing first since it's more reliable
+                    message_bytes = msg.value()
+                    
+                    # Check if it's a Schema Registry format message
+                    if len(message_bytes) >= 5 and message_bytes[0:2] == b'\x00\x00':
+                        # Schema Registry format: [0, 0, schema_id_high, schema_id_low, ...json_data]
+                        try:
+                            # Extract JSON data (skip the 5-byte header)
+                            json_data = message_bytes[5:].decode('utf-8')
+                            transaction_dict = json.loads(json_data)
+                            logger.info("Successfully parsed Schema Registry message")
+                        except Exception as manual_error:
+                            logger.error(f"Manual Schema Registry parsing failed: {manual_error}")
+                            # Try official deserializer as fallback
+                            if self.json_deserializer:
+                                try:
+                                    transaction_dict = self.json_deserializer(msg.value(), None)
+                                    logger.info("Used official Schema Registry deserializer")
+                                except Exception as e:
+                                    logger.error(f"Official Schema Registry deserialization failed: {e}")
+                                    continue
+                            else:
+                                continue
+                    else:
+                        # Try plain JSON deserialization
+                        try:
+                            transaction_dict = json.loads(msg.value().decode('utf-8'))
+                            logger.info("Deserialized message using plain JSON")
+                        except UnicodeDecodeError as decode_error:
+                            logger.error(f"Failed to decode message as UTF-8: {decode_error}")
+                            logger.error("Message appears to be binary but not Schema Registry format")
+                            continue
+                    
+                    transaction = Transaction(**transaction_dict)
                     
                     logger.info(f"Consumed transaction: {transaction.transaction_id}")
                     callback(transaction)
