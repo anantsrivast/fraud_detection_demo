@@ -11,8 +11,12 @@ import json
 import logging
 import asyncio
 from config.settings import Settings
+from langchain_openai import ChatOpenAI
+from config.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
 
 class WorkflowState(BaseModel):
     transaction: Transaction
@@ -62,7 +66,7 @@ async def duplicate_check(state: WorkflowState) -> WorkflowState:
             result["reason"] = "Duplicate complaint detected within 24 hours"
 
         state.duplicate_check = result
-        logger.info(f"Duplicate check completed for {transaction.transaction_id}: {is_duplicate}")
+       #logger.info(f"Duplicate check completed for {transaction.transaction_id}: {is_duplicate}")
         
         print(f"\n=== DUPLICATE CHECK COMPLETE ===")
         print(f"State after duplicate_check: {state}")

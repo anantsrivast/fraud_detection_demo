@@ -48,3 +48,4 @@ langgraph
 langchain-community
 langchain-openai
 langgraph-checkpoint-mongodb
+langsmith
