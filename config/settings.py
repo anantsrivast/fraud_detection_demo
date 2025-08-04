@@ -12,6 +12,7 @@ class Settings:
     KAFKA_API_KEY = os.getenv("KAFKA_API_KEY")
     KAFKA_API_SECRET = os.getenv("KAFKA_API_SECRET")
     KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "fraudulent-transactions")
+    KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "fraud-results")
     KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "fraud-detection-agents")
     
     # Schema Registry Configuration

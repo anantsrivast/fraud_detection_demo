@@ -6,3 +6,9 @@ agents/similarity_search_agent.py
 agents/action_recommendation_agent.py
 .env
 .env.example
+config/__pycache__/settings.cpython-313.pyc
+.gitignore
+config/__pycache__/__init__.cpython-313.pyc
+produce_to_topic.py
+README.md
+test_kafka_connectivity.py

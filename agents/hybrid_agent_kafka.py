@@ -202,6 +202,8 @@ async def store_transaction(state: WorkflowState) -> WorkflowState:
         state.errors.append(f"storage error: {str(e)}")
     return state
 
+
+
 def build_workflow():
     workflow = StateGraph(WorkflowState)
 

@@ -3,6 +3,7 @@ from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.json_schema import JSONSerializer, JSONDeserializer
 import json
 import logging
+import time
 from typing import Callable, Optional, Dict, Any
 from models.transaction import Transaction
 from config.settings import settings
@@ -30,6 +31,12 @@ class CloudKafkaService:
             'group.id': settings.KAFKA_CONSUMER_GROUP,
             'auto.offset.reset': 'beginning',
             'enable.auto.commit': True,
+        }
+        
+        # Schema Registry configuration
+        self.schema_registry_config = {
+            'url': settings.SCHEMA_REGISTRY_URL,
+            'basic.auth.user.info': f"{settings.SCHEMA_REGISTRY_API_KEY}:{settings.SCHEMA_REGISTRY_API_SECRET}"
         }
         
         # Schema Registry configuration
@@ -106,7 +113,7 @@ class CloudKafkaService:
             self.json_serializer = None
             self.json_deserializer = None
     
-    def publish_transaction(self, transaction: Transaction) -> bool:
+    def publish_transaction(self, transaction: Transaction, topic: str = None) -> bool:
         """Publish transaction to Confluent Kafka topic with Schema Registry"""
         try:
             if not self.producer:
@@ -116,16 +123,19 @@ class CloudKafkaService:
             if not self.schema_registry_client:
                 self.setup_schema_registry()
             
+            # Use specified topic or default to output topic
+            target_topic = topic or settings.KAFKA_OUTPUT_TOPIC
+            
             # Prepare transaction data
             transaction_dict = transaction.model_dump(default=str)
             
             # Use schema registry serializer if available, otherwise plain JSON
             if self.json_serializer:
                 serialized_data = self.json_serializer(transaction_dict, None)
-                logger.info("Published transaction using Schema Registry")
+                logger.info(f"Published transaction to {target_topic} using Schema Registry")
             else:
                 serialized_data = json.dumps(transaction_dict).encode('utf-8')
-                logger.info("Published transaction using plain JSON")
+                logger.info(f"Published transaction to {target_topic} using plain JSON")
             
             def delivery_report(err, msg):
                 if err is not None:
@@ -134,7 +144,7 @@ class CloudKafkaService:
                     logger.info(f'Message delivered to {msg.topic()} [{msg.partition()}]')
             
             self.producer.produce(
-                settings.KAFKA_TOPIC,
+                target_topic,
                 key=transaction.transaction_id,
                 value=serialized_data,
                 callback=delivery_report
@@ -146,6 +156,91 @@ class CloudKafkaService:
             
         except Exception as e:
             logger.error(f"Failed to publish transaction: {e}")
+            return False
+    
+    def publish_message(self, key: str, data: dict, topic: str) -> bool:
+        """Publish any message to a specified Kafka topic"""
+        try:
+            if not self.producer:
+                self.create_producer()
+            
+            # Setup schema registry if not already done
+            if not self.schema_registry_client:
+                self.setup_schema_registry()
+            
+            # Use schema registry serializer if available, otherwise plain JSON
+            if self.json_serializer:
+                serialized_data = self.json_serializer(data, None)
+                logger.info(f"Published message to {topic} using Schema Registry")
+            else:
+                serialized_data = json.dumps(data).encode('utf-8')
+                logger.info(f"Published message to {topic} using plain JSON")
+            
+            def delivery_report(err, msg):
+                if err is not None:
+                    logger.error(f'Message delivery failed: {err}')
+                else:
+                    logger.info(f'Message delivered to {msg.topic()} [{msg.partition()}]')
+            
+            self.producer.produce(
+                topic,
+                key=key,
+                value=serialized_data,
+                callback=delivery_report
+            )
+            
+            # Wait for message to be delivered
+            self.producer.flush()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to publish message: {e}")
+            return False
+    
+    def publish_fraud_result(self, transaction_id: str, fraud_result: dict) -> bool:
+        """Publish fraud detection result to the output topic"""
+        try:
+            if not self.producer:
+                self.create_producer()
+            
+            # Setup schema registry if not already done
+            if not self.schema_registry_client:
+                self.setup_schema_registry()
+            
+            # Prepare fraud result data
+            result_data = {
+                "transaction_id": transaction_id,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "fraud_result": fraud_result
+            }
+            
+            # Use schema registry serializer if available, otherwise plain JSON
+            if self.json_serializer:
+                serialized_data = self.json_serializer(result_data, None)
+                logger.info(f"Published fraud result to {settings.KAFKA_OUTPUT_TOPIC} using Schema Registry")
+            else:
+                serialized_data = json.dumps(result_data).encode('utf-8')
+                logger.info(f"Published fraud result to {settings.KAFKA_OUTPUT_TOPIC} using plain JSON")
+            
+            def delivery_report(err, msg):
+                if err is not None:
+                    logger.error(f'Message delivery failed: {err}')
+                else:
+                    logger.info(f'Fraud result delivered to {msg.topic()} [{msg.partition()}]')
+            
+            self.producer.produce(
+                settings.KAFKA_OUTPUT_TOPIC,
+                key=transaction_id,
+                value=serialized_data,
+                callback=delivery_report
+            )
+            
+            # Wait for message to be delivered
+            self.producer.flush()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to publish fraud result: {e}")
             return False
     
     def consume_transactions(self, callback: Callable[[Transaction], None]):
