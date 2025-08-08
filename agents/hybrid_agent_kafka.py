@@ -8,17 +8,6 @@ from services.cloud_kafka_service import CloudKafkaService
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, model_validator
 import json
-
-    
-        
-          
-    
-
-        
-        Expand All
-    
-    @@ -13,7 +14,21 @@
-  
 import logging
 import asyncio
 from config.settings import Settings
@@ -30,6 +19,7 @@ logger = logging.getLogger(__name__)
 class WorkflowState(BaseModel):
     """
     Represents the state passed between nodes in the LangGraph workflow.
+
     Attributes:
         transaction: The incoming transaction data.
         duplicate_check: Output of duplicate detection step.
@@ -42,22 +32,12 @@ class WorkflowState(BaseModel):
     transaction: Transaction
     duplicate_check: Optional[Dict[str, Any]] = None
     fraud_analysis: Optional[Dict[str, Any]] = None
-
-    
-        
-          
-    
-
-        
-        Expand All
-    
-    @@ -31,11 +46,22 @@ def convert_transaction_if_needed(cls, values):
-  
     similarity_data: Optional[Dict[str, Any]] = None
     recommendation: Optional[str] = None
     storage_status: Optional[str] = None
     errors: List[str] = []
     agent_reflection: Optional[str] = None
+
     @model_validator(mode="before")
     @classmethod
     def convert_transaction_if_needed(cls, values):
@@ -85,30 +65,15 @@ async def duplicate_check(state: WorkflowState) -> WorkflowState:
     try:
         transaction = state.transaction
 
-
-    
-          
-            
-    
-
-          
-          Expand Down
-          
-            
-    
-
-          
-          Expand Up
-    
-    @@ -67,15 +93,25 @@ def check_duplicate():
-  
         def check_duplicate():
             db = get_db()
             return db[Settings.MONGODB_COLLECTION_CASES].count_documents(
                 {"transaction_id": transaction.transaction_id}
             ) > 0
+
         loop = asyncio.get_event_loop()
         is_duplicate = await loop.run_in_executor(None, check_duplicate)
+
         result = {
             "is_duplicate": is_duplicate,
             "customer_id": transaction.customer_id,
@@ -116,10 +81,13 @@ async def duplicate_check(state: WorkflowState) -> WorkflowState:
             "checked_at": loop.time(),
             "recommendation": "SKIP_PROCESSING" if is_duplicate else "CONTINUE_PROCESSING"
         }
+
         if is_duplicate:
             result["reason"] = "Duplicate complaint detected within 24 hours"
+
         state.duplicate_check = result
         logger.info(f"Duplicate check completed for {transaction.transaction_id}: {is_duplicate}")
+
     except Exception as e:
         state.errors.append(f"duplicate_check error: {str(e)}")
 
@@ -147,28 +115,14 @@ async def similarity_search(state: WorkflowState) -> WorkflowState:
     try:
         loop = asyncio.get_event_loop()
         encoder = SentenceTransformer(Settings.EMBEDDING_MODEL)
-
-    
-          
-            
-    
-
-          
-          Expand Down
-          
-            
-    
-
-          
-          Expand Up
-    
-    @@ -166,6 +202,8 @@ def store():
-  
         fs = FraudSignatureService()
         signatures = fs.generate_fraud_signatures(state.transaction)
+
         def encode():
             return encoder.encode([" ".join(signatures)])[0]
+
         embedding = await loop.run_in_executor(None, encode)
+
         def search():
             db = get_db()
             return list(db[Settings.MONGODB_COLLECTION_SIGNATURES].aggregate([
@@ -180,8 +134,10 @@ async def similarity_search(state: WorkflowState) -> WorkflowState:
                     "limit": 5,
                 }}
             ]))
+
         results = await loop.run_in_executor(None, search)
         state.similarity_data = {"similar_cases": results}
+
         def insert_signature():
             db = get_db()
             db[Settings.MONGODB_COLLECTION_SIGNATURES].insert_one({
@@ -189,25 +145,32 @@ async def similarity_search(state: WorkflowState) -> WorkflowState:
                 "signatures": signatures,
                 "embedding": embedding
             })
+
         if state.fraud_analysis and state.fraud_analysis.get("is_fraud"):
             await loop.run_in_executor(None, insert_signature)
+
     except Exception as e:
         state.errors.append(f"similarity_search error: {str(e)}")
     return state
+
 async def agent_reflection(state: WorkflowState) -> WorkflowState:
     try:
         llm = ChatOpenAI(model="gpt-4", temperature=0)
         prompt = f"""
         As an AI fraud analyst, reflect on the following:
+
         - Fraud analysis result: {state.fraud_analysis}
         - Similarity search result: {state.similarity_data}
+
         What patterns stand out? What initial actions would you take and why?
         """
         response = await llm.ainvoke(prompt)
         state.agent_reflection = str(response.content if hasattr(response, "content") else response)
+
     except Exception as e:
         state.errors.append(f"agent_reflection error: {str(e)}")
     return state
+
 async def action_recommendation(state: WorkflowState) -> WorkflowState:
     try:
         llm = ChatOpenAI(model="gpt-4", temperature=0)
@@ -215,19 +178,23 @@ async def action_recommendation(state: WorkflowState) -> WorkflowState:
         prompt = f"""
         Given the analysis:
         {context}
+
         What should the fraud response team do?
         Explain your reasoning step-by-step before making a recommendation.
         """
         response = await llm.ainvoke(prompt)
         state.recommendation = str(response.content if hasattr(response, "content") else response)
+
     except Exception as e:
         state.errors.append(f"action_recommendation error: {str(e)}")
     return state
+
 async def store_transaction(state: WorkflowState) -> WorkflowState:
     try:
         def store():
             db = get_db()
             db[Settings.MONGODB_COLLECTION_CASES].insert_one(state.transaction.dict())
+
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, store)
         state.storage_status = "stored"
@@ -240,29 +207,13 @@ async def store_transaction(state: WorkflowState) -> WorkflowState:
 def build_workflow():
     workflow = StateGraph(WorkflowState)
 
-
-    
-          
-            
-    
-
-          
-          Expand Down
-          
-            
-    
-
-          
-          Expand Up
-    
-    @@ -194,16 +232,55 @@ def build_workflow():
-  
     workflow.add_node("duplicate", duplicate_check)
     workflow.add_node("classify", fraud_classification)
     workflow.add_node("similarity", similarity_search)
     workflow.add_node("reflect", agent_reflection)
     workflow.add_node("recommend", action_recommendation)
     workflow.add_node("store", store_transaction)
+
     workflow.set_entry_point("duplicate")
     workflow.add_conditional_edges(
         "duplicate",
@@ -302,7 +253,7 @@ def kafka_transaction_callback(transaction: Transaction):
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-
+        
         # Run the async workflow
         if loop.is_running():
             # If we're already in an event loop, create a task
@@ -315,18 +266,18 @@ def kafka_transaction_callback(transaction: Transaction):
 
 if __name__ == "__main__":
     compiled = build_workflow()
-
+    
     # Initialize Kafka service
     kafka_service = CloudKafkaService()
-
+    
     try:
         print("Starting Kafka consumer for fraud detection workflow...")
         print(f"Listening on topic: {Settings.KAFKA_TOPIC}")
         print("Press Ctrl+C to stop...")
-
+        
         # Start consuming transactions from Kafka
         kafka_service.consume_transactions(kafka_transaction_callback)
-
+        
     except KeyboardInterrupt:
         print("\nShutting down...")
     except Exception as e:
