@@ -8,6 +8,8 @@ langgraph
 
 # Kafka
 confluent-kafka
+cachetools
+authlib
 
 # MongoDB
 pymongo
