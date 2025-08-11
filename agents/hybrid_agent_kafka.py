@@ -4,6 +4,7 @@ from sentence_transformers import SentenceTransformer
 from pymongo import MongoClient
 from models.transaction import Transaction
 from services.fraud_signature_service import FraudSignatureService
+from services.cloud_kafka_service import CloudKafkaService
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, model_validator
 import json
@@ -13,7 +14,21 @@ from config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+# -------------------- State Definition --------------------
+
 class WorkflowState(BaseModel):
+    """
+    Represents the state passed between nodes in the LangGraph workflow.
+
+    Attributes:
+        transaction: The incoming transaction data.
+        duplicate_check: Output of duplicate detection step.
+        fraud_analysis: Output of fraud classification.
+        similarity_data: Output of vector similarity search.
+        recommendation: LLM-generated action recommendation.
+        storage_status: Result of storing the transaction.
+        errors: List of error messages collected during processing.
+    """
     transaction: Transaction
     duplicate_check: Optional[Dict[str, Any]] = None
     fraud_analysis: Optional[Dict[str, Any]] = None
@@ -31,11 +46,22 @@ class WorkflowState(BaseModel):
             values["transaction"] = Transaction(**txn)
         return values
 
+# -------------------- MongoDB Connection --------------------
+
 def get_db():
+    """
+    Establishes and returns a MongoDB database connection.
+    """
     client = MongoClient(Settings.MONGODB_URI)
     return client[Settings.MONGODB_DATABASE]
 
+# -------------------- Duplicate Check --------------------
+
 async def duplicate_check(state: WorkflowState) -> WorkflowState:
+    """
+    Checks if the transaction is a duplicate by querying MongoDB.
+    Adds a recommendation to skip or continue based on match.
+    """
     try:
         transaction = state.transaction
 
@@ -67,7 +93,12 @@ async def duplicate_check(state: WorkflowState) -> WorkflowState:
 
     return state
 
+# -------------------- Fraud Classification --------------------
+
 async def fraud_classification(state: WorkflowState) -> WorkflowState:
+    """
+    Classifies the transaction as fraud or not based on the amount.
+    """
     try:
         amt = state.transaction.amount or 0
         state.fraud_analysis = {"is_fraud": amt > 1000}
@@ -75,7 +106,12 @@ async def fraud_classification(state: WorkflowState) -> WorkflowState:
         state.errors.append(f"fraud_classification error: {str(e)}")
     return state
 
+# -------------------- Similarity Search --------------------
+
 async def similarity_search(state: WorkflowState) -> WorkflowState:
+    """
+    Searches for similar cases in the database using vector similarity.
+    """
     try:
         loop = asyncio.get_event_loop()
         encoder = SentenceTransformer(Settings.EMBEDDING_MODEL)
@@ -166,6 +202,8 @@ async def store_transaction(state: WorkflowState) -> WorkflowState:
         state.errors.append(f"storage error: {str(e)}")
     return state
 
+
+
 def build_workflow():
     workflow = StateGraph(WorkflowState)
 
@@ -194,16 +232,55 @@ def build_workflow():
 
     return workflow.compile()
 
+async def process_transaction_from_kafka(transaction: Transaction):
+    """Process a single transaction from Kafka through the workflow"""
+    try:
+        print(f"\n========= Processing Transaction: {transaction.transaction_id} =========")
+        state = WorkflowState(transaction=transaction)
+        final_state = await compiled.ainvoke(state)
+        print(f"Final state for {transaction.transaction_id}: {final_state}")
+        return final_state
+    except Exception as e:
+        logger.error(f"Error processing transaction {transaction.transaction_id}: {e}")
+        return None
+
+def kafka_transaction_callback(transaction: Transaction):
+    """Callback function for Kafka consumer to process transactions"""
+    try:
+        # Create a new event loop for this thread if needed
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Run the async workflow
+        if loop.is_running():
+            # If we're already in an event loop, create a task
+            asyncio.create_task(process_transaction_from_kafka(transaction))
+        else:
+            # If no event loop is running, run the coroutine
+            loop.run_until_complete(process_transaction_from_kafka(transaction))
+    except Exception as e:
+        logger.error(f"Error in Kafka callback: {e}")
+
 if __name__ == "__main__":
     compiled = build_workflow()
-    with open("merged_transactions.json") as f:
-        txns = json.load(f)
-
-    async def run():
-        for txn in txns[:5]:
-            print("\n=========")
-            state = WorkflowState(transaction=txn)
-            final_state = await compiled.ainvoke(state)
-            print("Final:", final_state)
-
-    asyncio.run(run())
+    
+    # Initialize Kafka service
+    kafka_service = CloudKafkaService()
+    
+    try:
+        print("Starting Kafka consumer for fraud detection workflow...")
+        print(f"Listening on topic: {Settings.KAFKA_TOPIC}")
+        print("Press Ctrl+C to stop...")
+        
+        # Start consuming transactions from Kafka
+        kafka_service.consume_transactions(kafka_transaction_callback)
+        
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    except Exception as e:
+        logger.error(f"Error in main execution: {e}")
+    finally:
+        kafka_service.close()
