@@ -401,9 +401,7 @@ async def run_workflow_with_checkpoint(compiled_workflow, transaction_data: dict
         
         if existing_state and existing_state.values:
             logger.info(f"Resuming workflow from checkpoint for thread: {thread_id}")
-            # Hydrate checkpoint dict -> WorkflowState before invoking
-            start_state = ensure_state(existing_state.values)
-            final_state = await compiled_workflow.ainvoke(start_state, config=config)
+            final_state = await compiled_workflow.ainvoke(None, config=config)
         else:
             logger.info(f"Starting new workflow for thread: {thread_id}")
             # Start fresh workflow
