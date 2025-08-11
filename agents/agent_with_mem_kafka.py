@@ -99,6 +99,11 @@ def pretty_storage(status: Optional[str], txn_id: str) -> None:
     kv("Transaction ID", txn_id)
     kv("Status", status or "unknown")
 
+def pretty_publish(status: Optional[str], txn_id: str) -> None:
+    hr("Kafka Publishing")
+    kv("Transaction ID", txn_id)
+    kv("Status", status or "unknown")
+
 def pretty_final(state: "WorkflowState") -> None:  # type: ignore
     hr("Final Summary")
     kv("Transaction ID", state.transaction.transaction_id)
@@ -106,6 +111,7 @@ def pretty_final(state: "WorkflowState") -> None:  # type: ignore
     kv("Fraud", yes_no(state.fraud_analysis.get("is_fraud") if state.fraud_analysis else False))
     kv("Similar Cases", len((state.similarity_data or {}).get("similar_cases", [])))
     kv("Recommendation", state.recommendation or "N/A")
+    kv("Published", yes_no(state.publish_status == "published"))
     if state.errors:
         print("\nErrors:")
         for e in state.errors:
@@ -123,6 +129,7 @@ class WorkflowState(BaseModel):
     similarity_data: Optional[Dict[str, Any]] = None
     recommendation: Optional[str] = None
     storage_status: Optional[str] = None
+    publish_status: Optional[str] = None
     errors: List[str] = Field(default_factory=list)  # avoid shared mutable default
     agent_reflection: Optional[str] = None
 
@@ -351,6 +358,46 @@ async def store_transaction(state: WorkflowState) -> WorkflowState:
         state.errors.append(f"storage error: {str(e)}")
     return state
 
+async def publish_result(state: WorkflowState) -> WorkflowState:
+    """Publish the complete workflow result to Kafka output topic"""
+    try:
+        # Create a comprehensive result payload
+        result_payload = {
+            "transaction_id": state.transaction.transaction_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "transaction": state.transaction.model_dump() if hasattr(state.transaction, 'model_dump') else state.transaction.dict(),
+            "fraud_analysis": state.fraud_analysis,
+            "similarity_data": state.similarity_data,
+            "recommendation": state.recommendation,
+            "agent_reflection": state.agent_reflection,
+            "storage_status": state.storage_status,
+            "errors": state.errors
+        }
+        
+        # Use the existing Kafka service to publish
+        kafka_service = CloudKafkaService()
+        success = kafka_service.publish_message(
+            key=state.transaction.transaction_id,
+            data=result_payload,
+            topic=Settings.KAFKA_OUTPUT_TOPIC
+        )
+        
+        if success:
+            state.publish_status = "published"
+            logger.info(f"Published result for transaction {state.transaction.transaction_id}")
+        else:
+            state.publish_status = "failed"
+            state.errors.append("Failed to publish result to Kafka")
+            
+        # Pretty print
+        pretty_publish(state.publish_status, state.transaction.transaction_id)
+        
+    except Exception as e:
+        state.errors.append(f"publish_result error: {str(e)}")
+        state.publish_status = "error"
+    
+    return state
+
 def build_workflow(checkpointer):
     """Build the LangGraph workflow with MongoDB checkpointing"""
     workflow = StateGraph(WorkflowState)
@@ -362,6 +409,7 @@ def build_workflow(checkpointer):
     workflow.add_node("reflect", agent_reflection)
     workflow.add_node("recommend", action_recommendation)
     workflow.add_node("store", store_transaction)
+    workflow.add_node("publish", publish_result) # Add the new node
 
     # Define the workflow
     workflow.set_entry_point("duplicate")
@@ -381,7 +429,8 @@ def build_workflow(checkpointer):
     workflow.add_edge("similarity", "reflect")
     workflow.add_edge("reflect", "recommend")
     workflow.add_edge("recommend", "store")
-    workflow.add_edge("store", END)
+    workflow.add_edge("store", "publish") # Add the new edge
+    workflow.add_edge("publish", END)
 
     # Compile with MongoDB checkpointer
     return workflow.compile(checkpointer=checkpointer)
