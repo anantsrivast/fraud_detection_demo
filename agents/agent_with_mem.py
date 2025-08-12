@@ -17,8 +17,8 @@ from datetime import datetime
 import time
 
 logger = get_logger(__name__)
-
-
+client = MongoClient(Settings.MONGODB_URI)
+encoder = SentenceTransformer(Settings.EMBEDDING_MODEL)
 # ---------------------------
 # State hydration helper (dict -> WorkflowState)
 # ---------------------------
@@ -139,7 +139,6 @@ class WorkflowState(BaseModel):
 # ---------------------------
 # DB
 # ---------------------------
-client = MongoClient(Settings.MONGODB_URI)
 def get_db():
     return client[Settings.MONGODB_DATABASE]
 
@@ -199,7 +198,6 @@ async def fraud_classification(state: WorkflowState) -> WorkflowState:
 async def similarity_search(state: WorkflowState) -> WorkflowState:
     try:
         loop = asyncio.get_event_loop()
-        encoder = SentenceTransformer(Settings.EMBEDDING_MODEL)
         fs = FraudSignatureService()
         signatures = fs.generate_fraud_signatures(state.transaction)
 
