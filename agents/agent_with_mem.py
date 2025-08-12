@@ -139,11 +139,9 @@ class WorkflowState(BaseModel):
 # ---------------------------
 # DB
 # ---------------------------
-
+client = MongoClient(Settings.MONGODB_URI)
 def get_db():
-    client = MongoClient(Settings.MONGODB_URI)
     return client[Settings.MONGODB_DATABASE]
-
 
 # ---------------------------
 # Nodes
