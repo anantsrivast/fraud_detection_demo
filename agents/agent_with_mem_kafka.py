@@ -1,6 +1,6 @@
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.mongodb.aio import AsyncMongoDBSaver  # Use async version
+from langgraph.checkpoint.mongodb.aio import AsyncMongoDBSaver
 from sentence_transformers import SentenceTransformer
 from pymongo import MongoClient
 from models.transaction import Transaction
@@ -8,7 +8,6 @@ from services.fraud_signature_service import FraudSignatureService
 from services.cloud_kafka_service import CloudKafkaService
 from typing import Dict, Any, List, Optional, Union
 from pydantic import BaseModel, Field, model_validator
-import json
 import logging
 import asyncio
 from config.settings import Settings
@@ -351,6 +350,53 @@ async def store_transaction(state: WorkflowState) -> WorkflowState:
         state.errors.append(f"storage error: {str(e)}")
     return state
 
+async def publish_result(state: WorkflowState) -> WorkflowState:
+    """Publish the complete workflow result to Kafka output topic"""
+    try:
+        # Helper function to serialize datetime objects
+        def serialize_datetime(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat() + "Z"
+            elif isinstance(obj, dict):
+                return {k: serialize_datetime(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [serialize_datetime(item) for item in obj]
+            else:
+                return obj
+        
+        # Create a comprehensive result payload
+        result_payload = {
+            "transaction_id": state.transaction.transaction_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "transaction": serialize_datetime(state.transaction.model_dump() if hasattr(state.transaction, 'model_dump') else state.transaction.dict()),
+            "fraud_analysis": serialize_datetime(state.fraud_analysis),
+            "similarity_data": serialize_datetime(state.similarity_data),
+            "recommendation": state.recommendation,
+            "agent_reflection": state.agent_reflection,
+            "storage_status": state.storage_status,
+            "errors": state.errors
+        }
+        
+        # Use the existing Kafka service to publish
+        kafka_service = CloudKafkaService()
+        success = kafka_service.publish_message(
+            key=state.transaction.transaction_id,
+            data=result_payload,
+            topic=Settings.KAFKA_OUTPUT_TOPIC
+        )
+        
+        if success:
+            logger.info(f"Published result for transaction {state.transaction.transaction_id}")
+        else:
+            state.errors.append("Failed to publish result to Kafka")
+            
+    except Exception as e:
+        state.errors.append(f"publish_result error: {str(e)}")
+    
+    return state
+
+
+
 def build_workflow(checkpointer):
     """Build the LangGraph workflow with MongoDB checkpointing"""
     workflow = StateGraph(WorkflowState)
@@ -362,6 +408,7 @@ def build_workflow(checkpointer):
     workflow.add_node("reflect", agent_reflection)
     workflow.add_node("recommend", action_recommendation)
     workflow.add_node("store", store_transaction)
+    workflow.add_node("publish", publish_result)
 
     # Define the workflow
     workflow.set_entry_point("duplicate")
@@ -369,19 +416,20 @@ def build_workflow(checkpointer):
     workflow.add_conditional_edges(
         "duplicate",
         lambda s: "skip" if s.duplicate_check and s.duplicate_check.get("is_duplicate") else "classify",
-        {"skip": END, "classify": "classify"}
+        {"skip": "publish", "classify": "classify"}
     )
     
     workflow.add_conditional_edges(
         "classify",
-        lambda s: "similarity" if s.fraud_analysis and s.fraud_analysis.get("is_fraud") else "skip",
-        {"similarity": "similarity", "skip": END}
+        lambda s: "similarity" if s.fraud_analysis and s.fraud_analysis.get("is_fraud") else "publish",
+        {"similarity": "similarity", "publish": "publish"}
     )
     
     workflow.add_edge("similarity", "reflect")
     workflow.add_edge("reflect", "recommend")
     workflow.add_edge("recommend", "store")
-    workflow.add_edge("store", END)
+    workflow.add_edge("store", "publish")
+    workflow.add_edge("publish", END)
 
     # Compile with MongoDB checkpointer
     return workflow.compile(checkpointer=checkpointer)
@@ -430,7 +478,6 @@ async def run_workflow_with_checkpoint(compiled_workflow, transaction_data: dict
 async def process_transaction_from_kafka(transaction: Transaction, compiled_workflow):
     """Process a single transaction from Kafka through the workflow with checkpointing"""
     try:
-        print(f"\n========= Processing Transaction: {transaction.transaction_id} =========")
         thread_id = f"txn_{transaction.transaction_id}"
         
         # Convert Transaction object to dict for workflow processing
@@ -453,22 +500,56 @@ async def process_transaction_from_kafka(transaction: Transaction, compiled_work
 def kafka_transaction_callback(transaction: Transaction, compiled_workflow):
     """Callback function for Kafka consumer to process transactions with checkpointing"""
     try:
-        # Create a new event loop for this thread if needed
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        print(f"\nProcessing transaction from Kafka: {transaction.transaction_id}")
+        print(f"{'='*60}")
         
-        # Run the async workflow with checkpointing
-        if loop.is_running():
-            # If we're already in an event loop, create a task
-            asyncio.create_task(process_transaction_from_kafka(transaction, compiled_workflow))
+        import concurrent.futures
+        
+        def run_workflow_sync():
+            try:
+                # Create a new event loop for this thread
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                # Create a completely fresh workflow for this transaction
+                async def run_fresh_workflow():
+                    from langgraph.checkpoint.mongodb import AsyncMongoDBSaver
+                    
+                    # Create a fresh MongoDB connection and workflow
+                    async with AsyncMongoDBSaver.from_conn_string(
+                        conn_string=Settings.MONGODB_URI,
+                        db_name=Settings.MONGODB_DATABASE,
+                        collection_name="langgraph_checkpoints"
+                    ) as checkpointer:
+                        workflow = build_workflow(checkpointer)
+                        return await process_transaction_from_kafka(transaction, workflow)
+                
+                # Run the fresh workflow
+                result = loop.run_until_complete(run_fresh_workflow())
+                return result
+                
+            except Exception as e:
+                print(f"Error in workflow thread: {e}")
+                return None
+            finally:
+                try:
+                    loop.close()
+                except:
+                    pass
+        
+        # Run the workflow in a thread pool to get the result
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_workflow_sync)
+            result = future.result()  # This will block until the workflow completes
+        
+        if result:
+            print(f"Workflow completed successfully for transaction: {transaction.transaction_id}")
         else:
-            # If no event loop is running, run the coroutine
-            loop.run_until_complete(process_transaction_from_kafka(transaction, compiled_workflow))
+            print(f"Workflow failed for transaction: {transaction.transaction_id}")
+        
     except Exception as e:
         logger.error(f"Error in Kafka callback: {e}")
+        print(f"Kafka callback error: {e}")
 
 async def main():
     """Main execution function using async context manager with Kafka consumption"""
