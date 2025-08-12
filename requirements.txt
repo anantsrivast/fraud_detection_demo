@@ -51,3 +51,4 @@ langchain-community
 langchain-openai
 langgraph-checkpoint-mongodb
 langsmith
+langgraph-cli[inmem]
