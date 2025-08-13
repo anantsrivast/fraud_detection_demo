@@ -8,7 +8,7 @@ load_dotenv(dotenv_path=env_path)
 
 class Settings:
     # Cloud Kafka Configuration (Confluent Cloud)
-     KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+    KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
     KAFKA_API_KEY = os.getenv("KAFKA_API_KEY")
     KAFKA_API_SECRET = os.getenv("KAFKA_API_SECRET")
     KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "fraudulent-transactions")
