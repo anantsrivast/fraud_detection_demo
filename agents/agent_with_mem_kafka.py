@@ -1,6 +1,6 @@
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.mongodb.aio import AsyncMongoDBSaver  # Use async version
+from langgraph.checkpoint.mongodb.aio import AsyncMongoDBSaver
 from sentence_transformers import SentenceTransformer
 from pymongo import MongoClient
 from models.transaction import Transaction
@@ -8,15 +8,19 @@ from services.fraud_signature_service import FraudSignatureService
 from services.cloud_kafka_service import CloudKafkaService
 from typing import Dict, Any, List, Optional, Union
 from pydantic import BaseModel, Field, model_validator
-import json
 import logging
 import asyncio
 from config.settings import Settings
 from config.logger import get_logger
 from datetime import datetime
+from utils.print_helper import *
 import time
+import json
 
 logger = get_logger(__name__)
+
+client = MongoClient(Settings.MONGODB_URI)
+encoder = SentenceTransformer(Settings.EMBEDDING_MODEL)
 
 # ---------------------------
 # State hydration helper (dict -> WorkflowState)
@@ -24,93 +28,6 @@ logger = get_logger(__name__)
 
 def ensure_state(s: Union["WorkflowState", dict]) -> "WorkflowState":
     return s if isinstance(s, WorkflowState) else WorkflowState(**s)
-
-
-# ---------------------------
-# Pretty-print helpers
-# ---------------------------
-
-def hr(title: str) -> None:
-    print(f"\n{'=' * 8} {title.upper()} {'=' * 8}")
-
-def kv(key: str, value: Any) -> None:
-    print(f"- {key}: {value}")
-
-def yes_no(flag: bool) -> str:
-    return "YES" if flag else "NO"
-
-def pretty_duplicate(result: Dict[str, Any]) -> None:
-    hr("Duplicate Check")
-    kv("Duplicate", yes_no(result.get("is_duplicate", False)))
-    if result.get("is_duplicate"):
-        kv("Reason", result.get("reason", "Possible duplicate detected"))
-    kv("Customer ID", result.get("customer_id"))
-    kv("Transaction ID", result.get("transaction_id"))
-    ts = result.get("checked_at")
-    if ts:
-        kv("Checked At (utc)", datetime.utcfromtimestamp(ts).isoformat() + "Z")
-    kv("Next Step", result.get("recommendation"))
-
-def pretty_fraud(analysis: Dict[str, Any], amount: float) -> None:
-    hr("Fraud Classification")
-    kv("Is Fraud", yes_no(analysis.get("is_fraud", False)))
-    kv("Amount", amount)
-
-def pretty_similarity(data: Dict[str, Any]) -> None:
-    hr("Similarity Detection")
-    sigs: List[str] = data.get("query_signatures", [])
-    if sigs:
-        kv("Generated Signatures", ", ".join(sigs))
-    sims: List[Dict[str, Any]] = data.get("similar_cases", []) or []
-    if not sims:
-        print("No similar cases found.")
-        return
-    print("Top Similar Cases:")
-    # We assume each result may include a similarity score under 'score'
-    # and may contain 'transaction_id' or an '_id'. We handle both.
-    for i, doc in enumerate(sims, 1):
-        tid = doc.get("transaction_id") or doc.get("_id")
-        score = doc.get("score")
-        line = f"  {i}. id={tid}"
-        if score is not None:
-            line += f" | score={round(float(score), 4)}"
-        print(line)
-        # If stored signatures are present in similar doc, show a short preview
-        if isinstance(doc.get("signatures"), list) and doc["signatures"]:
-            preview = ", ".join(doc["signatures"][:3])
-            print(f"     signatures: {preview}{' ...' if len(doc['signatures']) > 3 else ''}")
-
-def pretty_reflection(text: Optional[str]) -> None:
-    hr("Agent Reflection")
-    if text:
-        print(text.strip())
-    else:
-        print("No reflection available.")
-
-def pretty_recommendation(text: Optional[str]) -> None:
-    hr("Action Recommendation")
-    if text:
-        print(text.strip())
-    else:
-        print("No recommendation available.")
-
-def pretty_storage(status: Optional[str], txn_id: str) -> None:
-    hr("Storage")
-    kv("Transaction ID", txn_id)
-    kv("Status", status or "unknown")
-
-def pretty_final(state: "WorkflowState") -> None:  # type: ignore
-    hr("Final Summary")
-    kv("Transaction ID", state.transaction.transaction_id)
-    kv("Duplicate", yes_no(state.duplicate_check.get("is_duplicate") if state.duplicate_check else False))
-    kv("Fraud", yes_no(state.fraud_analysis.get("is_fraud") if state.fraud_analysis else False))
-    kv("Similar Cases", len((state.similarity_data or {}).get("similar_cases", [])))
-    kv("Recommendation", state.recommendation or "N/A")
-    if state.errors:
-        print("\nErrors:")
-        for e in state.errors:
-            print(f"  - {e}")
-
 
 # ---------------------------
 # Pydantic model
@@ -135,7 +52,6 @@ class WorkflowState(BaseModel):
         return values
 
 def get_db():
-    client = MongoClient(Settings.MONGODB_URI)
     return client[Settings.MONGODB_DATABASE]
 
 async def duplicate_check(state: WorkflowState) -> WorkflowState:
@@ -189,7 +105,6 @@ async def fraud_classification(state: WorkflowState) -> WorkflowState:
 async def similarity_search(state: WorkflowState) -> WorkflowState:
     try:
         loop = asyncio.get_event_loop()
-        encoder = SentenceTransformer(Settings.EMBEDDING_MODEL)
         fs = FraudSignatureService()
         signatures = fs.generate_fraud_signatures(state.transaction)
 
@@ -351,6 +266,53 @@ async def store_transaction(state: WorkflowState) -> WorkflowState:
         state.errors.append(f"storage error: {str(e)}")
     return state
 
+async def publish_result(state: WorkflowState) -> WorkflowState:
+    """Publish the complete workflow result to Kafka output topic"""
+    try:
+        # Helper function to serialize datetime objects
+        def serialize_datetime(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat() + "Z"
+            elif isinstance(obj, dict):
+                return {k: serialize_datetime(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [serialize_datetime(item) for item in obj]
+            else:
+                return obj
+        
+        # Create a comprehensive result payload
+        result_payload = {
+            "transaction_id": state.transaction.transaction_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "transaction": serialize_datetime(state.transaction.model_dump() if hasattr(state.transaction, 'model_dump') else state.transaction.dict()),
+            "fraud_analysis": serialize_datetime(state.fraud_analysis),
+            "similarity_data": serialize_datetime(state.similarity_data),
+            "recommendation": state.recommendation,
+            "agent_reflection": state.agent_reflection,
+            "storage_status": state.storage_status,
+            "errors": state.errors
+        }
+        
+        # Use the existing Kafka service to publish
+        kafka_service = CloudKafkaService()
+        success = kafka_service.publish_message(
+            key=state.transaction.transaction_id,
+            data=result_payload,
+            topic=Settings.KAFKA_OUTPUT_TOPIC
+        )
+        
+        if success:
+            logger.info(f"Published result for transaction {state.transaction.transaction_id}")
+        else:
+            state.errors.append("Failed to publish result to Kafka")
+            
+    except Exception as e:
+        state.errors.append(f"publish_result error: {str(e)}")
+    
+    return state
+
+
+
 def build_workflow(checkpointer):
     """Build the LangGraph workflow with MongoDB checkpointing"""
     workflow = StateGraph(WorkflowState)
@@ -362,6 +324,7 @@ def build_workflow(checkpointer):
     workflow.add_node("reflect", agent_reflection)
     workflow.add_node("recommend", action_recommendation)
     workflow.add_node("store", store_transaction)
+    workflow.add_node("publish", publish_result)
 
     # Define the workflow
     workflow.set_entry_point("duplicate")
@@ -369,19 +332,20 @@ def build_workflow(checkpointer):
     workflow.add_conditional_edges(
         "duplicate",
         lambda s: "skip" if s.duplicate_check and s.duplicate_check.get("is_duplicate") else "classify",
-        {"skip": END, "classify": "classify"}
+        {"skip": "publish", "classify": "classify"}
     )
     
     workflow.add_conditional_edges(
         "classify",
-        lambda s: "similarity" if s.fraud_analysis and s.fraud_analysis.get("is_fraud") else "skip",
-        {"similarity": "similarity", "skip": END}
+        lambda s: "similarity" if s.fraud_analysis and s.fraud_analysis.get("is_fraud") else "publish",
+        {"similarity": "similarity", "publish": "publish"}
     )
     
     workflow.add_edge("similarity", "reflect")
     workflow.add_edge("reflect", "recommend")
     workflow.add_edge("recommend", "store")
-    workflow.add_edge("store", END)
+    workflow.add_edge("store", "publish")
+    workflow.add_edge("publish", END)
 
     # Compile with MongoDB checkpointer
     return workflow.compile(checkpointer=checkpointer)
@@ -430,7 +394,6 @@ async def run_workflow_with_checkpoint(compiled_workflow, transaction_data: dict
 async def process_transaction_from_kafka(transaction: Transaction, compiled_workflow):
     """Process a single transaction from Kafka through the workflow with checkpointing"""
     try:
-        print(f"\n========= Processing Transaction: {transaction.transaction_id} =========")
         thread_id = f"txn_{transaction.transaction_id}"
         
         # Convert Transaction object to dict for workflow processing
@@ -450,25 +413,96 @@ async def process_transaction_from_kafka(transaction: Transaction, compiled_work
         logger.error(f"Error processing transaction {transaction.transaction_id}: {e}")
         return None
 
-def kafka_transaction_callback(transaction: Transaction, compiled_workflow):
-    """Callback function for Kafka consumer to process transactions with checkpointing"""
+async def kafka_transaction_callback(transaction: Transaction, compiled_workflow):
+    """Async callback function for Kafka consumer to process transactions with checkpointing"""
     try:
-        # Create a new event loop for this thread if needed
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        print(f"\nProcessing transaction from Kafka: {transaction.transaction_id}")
+        print(f"{'='*60}")
         
-        # Run the async workflow with checkpointing
-        if loop.is_running():
-            # If we're already in an event loop, create a task
-            asyncio.create_task(process_transaction_from_kafka(transaction, compiled_workflow))
+        result = await process_transaction_from_kafka(transaction, compiled_workflow)
+        
+        if result:
+            print(f"Workflow completed successfully for transaction: {transaction.transaction_id}")
         else:
-            # If no event loop is running, run the coroutine
-            loop.run_until_complete(process_transaction_from_kafka(transaction, compiled_workflow))
+            print(f"Workflow failed for transaction: {transaction.transaction_id}")
+        
     except Exception as e:
         logger.error(f"Error in Kafka callback: {e}")
+        print(f"Kafka callback error: {e}")
+
+async def consume_transactions_async(kafka_service, compiled_workflow):
+    """Async version of consume_transactions that processes messages asynchronously"""
+    try:
+        if not kafka_service.consumer:
+            kafka_service.create_consumer()
+        
+        # Setup schema registry if not already done
+        if not kafka_service.schema_registry_client:
+            kafka_service.setup_schema_registry()
+ 
+        poll_count = 0
+        while True:
+            try:
+                poll_count += 1
+                logger.info(f"Poll #{poll_count} - waiting for message...")
+                
+                msg = kafka_service.consumer.poll(timeout=1.0)
+                
+                if msg is None:
+                    logger.info(f"   Poll #{poll_count}: No message received")
+                    continue
+                
+                if msg.error():
+                    logger.error(f"   Poll #{poll_count}: Consumer error: {msg.error()}")
+                    continue
+                
+                # Parse message 
+                message_bytes = msg.value()
+                logger.info(f"   Message bytes: {message_bytes[:20]}... (first 20 bytes)")
+
+                # Parse message using manual Schema Registry format detection
+                # Check if it's a Schema Registry format message
+                if len(message_bytes) >= 5 and message_bytes[0:2] == b'\x00\x00':
+                    # Schema Registry format: [0, 0, schema_id_high, schema_id_low, ...json_data]
+                    try:
+                        # Extract JSON data (skip the 5-byte header)
+                        json_data = message_bytes[5:].decode('utf-8')
+                        transaction_dict = json.loads(json_data)
+                    except Exception as manual_error:
+                        logger.error(f"Manual Schema Registry parsing failed: {manual_error}")
+                        continue
+                else:
+                    # Try plain JSON deserialization
+                    try:
+                        transaction_dict = json.loads(msg.value().decode('utf-8'))
+                    except UnicodeDecodeError as decode_error:
+                        logger.error(f"Failed to decode message as UTF-8: {decode_error}")
+                        logger.error("   Message appears to be binary but not Schema Registry format")
+                        continue
+                    except json.JSONDecodeError as json_error:
+                        logger.error(f"Failed to parse JSON: {json_error}")
+                        continue
+                
+                try:
+                    transaction = Transaction(**transaction_dict)
+                    
+                    # Process transaction asynchronously
+                    await kafka_transaction_callback(transaction, compiled_workflow)
+                except Exception as transaction_error:
+                    logger.error(f"Failed to create Transaction object: {transaction_error}")
+                    logger.error(f"   Transaction dict: {transaction_dict}")
+                    continue
+                
+            except KeyboardInterrupt:
+                logger.info("Received keyboard interrupt, shutting down...")
+                break
+            except Exception as e:
+                logger.error(f"Error in message processing loop: {e}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"Error in async consumer: {e}")
+        raise
 
 async def main():
     """Main execution function using async context manager with Kafka consumption"""
@@ -494,12 +528,8 @@ async def main():
             print(f"Listening on topic: {Settings.KAFKA_TOPIC}")
             print("Press Ctrl+C to stop...")
             
-            # Create a callback function that includes the compiled workflow
-            def callback_with_workflow(transaction: Transaction):
-                kafka_transaction_callback(transaction, compiled_workflow)
-            
-            # Start consuming transactions from Kafka
-            kafka_service.consume_transactions(callback_with_workflow)
+            # Start consuming transactions from Kafka asynchronously
+            await consume_transactions_async(kafka_service, compiled_workflow)
             
         except KeyboardInterrupt:
             print("\nShutting down...")

@@ -1,42 +1,42 @@
-from confluent_kafka import Producer, Consumer, KafkaException
+from confluent_kafka import Producer, Consumer
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.json_schema import JSONSerializer, JSONDeserializer
 import json
 import logging
 import time
-from typing import Callable, Optional, Dict, Any
+from typing import Callable, Optional
 from models.transaction import Transaction
-from config.settings import settings
+from config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
 class CloudKafkaService:
     def __init__(self):
         self.producer_config = {
-            'bootstrap.servers': settings.KAFKA_BOOTSTRAP_SERVERS,
+            'bootstrap.servers': Settings.KAFKA_BOOTSTRAP_SERVERS,
             'sasl.mechanisms': 'PLAIN',
             'security.protocol': 'SASL_SSL',
-            'sasl.username': settings.KAFKA_API_KEY,
-            'sasl.password': settings.KAFKA_API_SECRET,
+            'sasl.username': Settings.KAFKA_API_KEY,
+            'sasl.password': Settings.KAFKA_API_SECRET,
             'acks': 'all',
             'retries': 3,
         }
         
         self.consumer_config = {
-            'bootstrap.servers': settings.KAFKA_BOOTSTRAP_SERVERS,
+            'bootstrap.servers': Settings.KAFKA_BOOTSTRAP_SERVERS,
             'sasl.mechanisms': 'PLAIN',
             'security.protocol': 'SASL_SSL',
-            'sasl.username': settings.KAFKA_API_KEY,
-            'sasl.password': settings.KAFKA_API_SECRET,
-            'group.id': settings.KAFKA_CONSUMER_GROUP,
-            'auto.offset.reset': 'beginning',
+            'sasl.username': Settings.KAFKA_API_KEY,
+            'sasl.password': Settings.KAFKA_API_SECRET,
+            'group.id': Settings.KAFKA_CONSUMER_GROUP,
+            'auto.offset.reset': 'earliest',
             'enable.auto.commit': True,
         }
 
         # Schema Registry configuration
         self.schema_registry_config = {
-            'url': settings.SCHEMA_REGISTRY_URL,
-            'basic.auth.user.info': f"{settings.SCHEMA_REGISTRY_API_KEY}:{settings.SCHEMA_REGISTRY_API_SECRET}"
+            'url': Settings.SCHEMA_REGISTRY_URL,
+            'basic.auth.user.info': f"{Settings.SCHEMA_REGISTRY_API_KEY}:{Settings.SCHEMA_REGISTRY_API_SECRET}"
         }
         
         self.producer: Optional[Producer] = None
@@ -58,54 +58,44 @@ class CloudKafkaService:
     def create_consumer(self) -> Consumer:
         """Create Confluent Kafka consumer"""
         try:
+            
             self.consumer = Consumer(self.consumer_config)
-            self.consumer.subscribe([settings.KAFKA_TOPIC])
-            logger.info(f"Confluent Kafka consumer created for topic: {settings.KAFKA_TOPIC}")
+            logger.info("Consumer object created")
+            
+            # Use manual partition assignment instead of group-based assignment
+            # This ensures we get assigned to partitions immediately
+            from confluent_kafka import TopicPartition
+            
+            # Get topic metadata to find available partitions
+            metadata = self.consumer.list_topics(Settings.KAFKA_TOPIC)
+            topic_metadata = metadata.topics.get(Settings.KAFKA_TOPIC)
+            
+            if topic_metadata and topic_metadata.partitions:
+                # Assign to all available partitions
+                partitions = [TopicPartition(Settings.KAFKA_TOPIC, p) for p in topic_metadata.partitions.keys()]
+                self.consumer.assign(partitions)
+                logger.info(f"Confluent Kafka consumer manually assigned to {len(partitions)} partitions for topic: {Settings.KAFKA_TOPIC}")
+            else:
+                logger.warning(f"Topic not found or no partitions, falling back to group-based assignment")
+                # Fallback to group-based assignment
+                self.consumer.subscribe([Settings.KAFKA_TOPIC])
+                logger.info(f"Confluent Kafka consumer using group-based assignment for topic: {Settings.KAFKA_TOPIC}")
+            
             return self.consumer
         except Exception as e:
             logger.error(f"Failed to create Confluent Kafka consumer: {e}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
             raise
     
     def setup_schema_registry(self):
         """Setup Schema Registry client and serializers"""
-        try:
-            if not settings.SCHEMA_REGISTRY_URL:
-                logger.warning("Schema Registry URL not configured, using plain JSON")
-                return
-
-            self.schema_registry_client = SchemaRegistryClient(self.schema_registry_config)
-
-            # Test Schema Registry connection
-            try:
-                subjects = self.schema_registry_client.get_subjects()
-                logger.info(f"Schema Registry connection successful - found {len(subjects)} subjects")
-            except Exception as e:
-                logger.error(f"Schema Registry connection test failed: {e}")
-                raise
-
-            # Create JSON serializer for producing
-            self.json_serializer = JSONSerializer(
-                self.schema_registry_client,
-                settings.SCHEMA_REGISTRY_SUBJECT
-            )
-
-            # Create JSON deserializer for consuming
-            # For deserialization, we don't specify a subject - it auto-detects from the message
-            # The from_dict parameter tells it how to convert the parsed JSON back to Python objects
-            self.json_deserializer = JSONDeserializer(
-                self.schema_registry_client,
-                from_dict=lambda obj, ctx: obj,
-                to_dict=lambda obj, ctx: obj
-            )
-
-            logger.info("Schema Registry setup completed successfully")
-
-        except Exception as e:
-            logger.error(f"Failed to setup Schema Registry: {e}")
-            # Fall back to plain JSON
-            self.schema_registry_client = None
-            self.json_serializer = None
-            self.json_deserializer = None
+        # For now, disable Schema Registry setup to avoid deserializer issues
+        # We'll rely on manual parsing of Schema Registry format messages
+        logger.info("Schema Registry setup disabled - using manual parsing")
+        self.schema_registry_client = None
+        self.json_serializer = None
+        self.json_deserializer = None
 
     def publish_transaction(self, transaction: Transaction, topic: str = None) -> bool:
         """Publish transaction to Confluent Kafka topic with Schema Registry"""
@@ -118,10 +108,14 @@ class CloudKafkaService:
                 self.setup_schema_registry()
 
             # Use specified topic or default to output topic
-            target_topic = topic or settings.KAFKA_OUTPUT_TOPIC
+            target_topic = topic or Settings.KAFKA_OUTPUT_TOPIC
 
-            # Prepare transaction data
-            transaction_dict = transaction.model_dump(default=str)
+            # Prepare transaction data with datetime handling
+            transaction_dict = transaction.model_dump()
+            # Convert datetime objects to ISO format strings
+            for key, value in transaction_dict.items():
+                if hasattr(value, 'isoformat'):
+                    transaction_dict[key] = value.isoformat()
 
             # Use schema registry serializer if available, otherwise plain JSON
             if self.json_serializer:
@@ -164,10 +158,8 @@ class CloudKafkaService:
             # Use schema registry serializer if available, otherwise plain JSON
             if self.json_serializer:
                 serialized_data = self.json_serializer(data, None)
-                logger.info(f"Published message to {topic} using Schema Registry")
             else:
                 serialized_data = json.dumps(data).encode('utf-8')
-                logger.info(f"Published message to {topic} using plain JSON")
 
             def delivery_report(err, msg):
                 if err is not None:
@@ -210,10 +202,10 @@ class CloudKafkaService:
             # Use schema registry serializer if available, otherwise plain JSON
             if self.json_serializer:
                 serialized_data = self.json_serializer(result_data, None)
-                logger.info(f"Published fraud result to {settings.KAFKA_OUTPUT_TOPIC} using Schema Registry")
+                logger.info(f"Published fraud result to {Settings.KAFKA_OUTPUT_TOPIC} using Schema Registry")
             else:
                 serialized_data = json.dumps(result_data).encode('utf-8')
-                logger.info(f"Published fraud result to {settings.KAFKA_OUTPUT_TOPIC} using plain JSON")
+                logger.info(f"Published fraud result to {Settings.KAFKA_OUTPUT_TOPIC} using plain JSON")
 
             def delivery_report(err, msg):
                 if err is not None:
@@ -222,7 +214,7 @@ class CloudKafkaService:
                     logger.info(f'Fraud result delivered to {msg.topic()} [{msg.partition()}]')
 
             self.producer.produce(
-                settings.KAFKA_OUTPUT_TOPIC,
+                Settings.KAFKA_OUTPUT_TOPIC,
                 key=transaction_id,
                 value=serialized_data,
                 callback=delivery_report
@@ -246,22 +238,39 @@ class CloudKafkaService:
             if not self.schema_registry_client:
                 self.setup_schema_registry()
                 
-            logger.info(f"Starting to consume transactions from topic: {settings.KAFKA_TOPIC}")
+            logger.info(f"Starting to consume transactions from topic: {Settings.KAFKA_TOPIC}")
             
+            # Get consumer assignment to verify subscription
+            assignment = self.consumer.assignment()
+            logger.info(f"Consumer assignment: {assignment}")
+            
+            if not assignment:
+                logger.error("No partition assignment - consumer cannot receive messages!")
+                return
+            
+            # Show partition details
+            for partition in assignment:
+                logger.info(f"  Partition {partition.partition}: offset {partition.offset}")
+            
+            poll_count = 0
             while True:
                 try:
+                    poll_count += 1
+                    
                     msg = self.consumer.poll(timeout=1.0)
                     
                     if msg is None:
+                        logger.info(f"   Poll #{poll_count}: No message received")
                         continue
                     
                     if msg.error():
-                        logger.error(f"Consumer error: {msg.error()}")
+                        logger.error(f"   Poll #{poll_count}: Consumer error: {msg.error()}")
                         continue
                     
                     # Parse message 
                     message_bytes = msg.value()
 
+                    # Parse message using manual Schema Registry format detection
                     # Check if it's a Schema Registry format message
                     if len(message_bytes) >= 5 and message_bytes[0:2] == b'\x00\x00':
                         # Schema Registry format: [0, 0, schema_id_high, schema_id_low, ...json_data]
@@ -269,48 +278,52 @@ class CloudKafkaService:
                             # Extract JSON data (skip the 5-byte header)
                             json_data = message_bytes[5:].decode('utf-8')
                             transaction_dict = json.loads(json_data)
-                            logger.info("Successfully parsed Schema Registry message")
                         except Exception as manual_error:
                             logger.error(f"Manual Schema Registry parsing failed: {manual_error}")
-                            # Try official deserializer as fallback
-                            if self.json_deserializer:
-                                try:
-                                    transaction_dict = self.json_deserializer(msg.value(), None)
-                                    logger.info("Used official Schema Registry deserializer")
-                                except Exception as e:
-                                    logger.error(f"Official Schema Registry deserialization failed: {e}")
-                                    continue
-                            else:
-                                continue
+                            continue
                     else:
                         # Try plain JSON deserialization
                         try:
                             transaction_dict = json.loads(msg.value().decode('utf-8'))
-                            logger.info("Deserialized message using plain JSON")
                         except UnicodeDecodeError as decode_error:
                             logger.error(f"Failed to decode message as UTF-8: {decode_error}")
-                            logger.error("Message appears to be binary but not Schema Registry format")
+                            logger.error("   Message appears to be binary but not Schema Registry format")
+                            continue
+                        except json.JSONDecodeError as json_error:
+                            logger.error(f"Failed to parse JSON: {json_error}")
                             continue
 
-                    transaction = Transaction(**transaction_dict)
+                    logger.info(f"   Transaction dict keys: {list(transaction_dict.keys())}")
                     
-                    logger.info(f"Consumed transaction: {transaction.transaction_id}")
-                    callback(transaction)
+                    try:
+                        transaction = Transaction(**transaction_dict)
+                        logger.info(f"Successfully created Transaction object: {transaction.transaction_id}")
+                        callback(transaction)
+                        logger.info(f"Callback executed successfully")
+                    except Exception as transaction_error:
+                        logger.error(f"Failed to create Transaction object: {transaction_error}")
+                        logger.error(f"   Transaction dict: {transaction_dict}")
+                        continue
                     
                 except json.JSONDecodeError as e:
-                    logger.error(f"Failed to decode message: {e}")
+                    logger.error(f"Poll #{poll_count}: Failed to decode message: {e}")
                     continue
                 except Exception as e:
-                    logger.error(f"Error processing message: {e}")
+                    logger.error(f"Poll #{poll_count}: Error processing message: {e}")
+                    import traceback
+                    logger.error(f"   Traceback: {traceback.format_exc()}")
                     continue
                     
         except KeyboardInterrupt:
             logger.info("Consumer stopped by user")
         except Exception as e:
             logger.error(f"Error in consumer: {e}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
         finally:
             if self.consumer:
                 self.consumer.close()
+                logger.info("Consumer closed")
     
     def close(self):
         """Close producer and consumer"""
