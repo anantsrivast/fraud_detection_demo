@@ -4,5 +4,5 @@ agents/duplicate_detection_agent.py
 agents/fraud_classification_agent.py
 agents/similarity_search_agent.py
 agents/action_recommendation_agent.py
-produce_to_topic.py
-test_kafka_connectivity.py
+tests/*
+*.DS_Store

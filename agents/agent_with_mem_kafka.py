@@ -13,10 +13,14 @@ import asyncio
 from config.settings import Settings
 from config.logger import get_logger
 from datetime import datetime
+from utils.print_helper import *
 import time
 import json
 
 logger = get_logger(__name__)
+
+client = MongoClient(Settings.MONGODB_URI)
+encoder = SentenceTransformer(Settings.EMBEDDING_MODEL)
 
 # ---------------------------
 # State hydration helper (dict -> WorkflowState)
@@ -24,99 +28,6 @@ logger = get_logger(__name__)
 
 def ensure_state(s: Union["WorkflowState", dict]) -> "WorkflowState":
     return s if isinstance(s, WorkflowState) else WorkflowState(**s)
-
-
-# ---------------------------
-# Pretty-print helpers
-# ---------------------------
-
-def hr(title: str) -> None:
-    print(f"\n{'=' * 8} {title.upper()} {'=' * 8}")
-
-def kv(key: str, value: Any) -> None:
-    print(f"- {key}: {value}")
-
-def yes_no(flag: bool) -> str:
-    return "YES" if flag else "NO"
-
-def pretty_duplicate(result: Dict[str, Any]) -> None:
-    hr("Duplicate Check")
-    kv("Duplicate", yes_no(result.get("is_duplicate", False)))
-    if result.get("is_duplicate"):
-        kv("Reason", result.get("reason", "Possible duplicate detected"))
-    kv("Customer ID", result.get("customer_id"))
-    kv("Transaction ID", result.get("transaction_id"))
-    ts = result.get("checked_at")
-    if ts:
-        kv("Checked At (utc)", datetime.utcfromtimestamp(ts).isoformat() + "Z")
-    kv("Next Step", result.get("recommendation"))
-
-def pretty_fraud(analysis: Dict[str, Any], amount: float) -> None:
-    hr("Fraud Classification")
-    kv("Is Fraud", yes_no(analysis.get("is_fraud", False)))
-    kv("Amount", amount)
-
-def pretty_similarity(data: Dict[str, Any]) -> None:
-    hr("Similarity Detection")
-    sigs: List[str] = data.get("query_signatures", [])
-    if sigs:
-        kv("Generated Signatures", ", ".join(sigs))
-    sims: List[Dict[str, Any]] = data.get("similar_cases", []) or []
-    if not sims:
-        print("No similar cases found.")
-        return
-    print("Top Similar Cases:")
-    # We assume each result may include a similarity score under 'score'
-    # and may contain 'transaction_id' or an '_id'. We handle both.
-    for i, doc in enumerate(sims, 1):
-        tid = doc.get("transaction_id") or doc.get("_id")
-        score = doc.get("score")
-        line = f"  {i}. id={tid}"
-        if score is not None:
-            line += f" | score={round(float(score), 4)}"
-        print(line)
-        # If stored signatures are present in similar doc, show a short preview
-        if isinstance(doc.get("signatures"), list) and doc["signatures"]:
-            preview = ", ".join(doc["signatures"][:3])
-            print(f"     signatures: {preview}{' ...' if len(doc['signatures']) > 3 else ''}")
-
-def pretty_reflection(text: Optional[str]) -> None:
-    hr("Agent Reflection")
-    if text:
-        print(text.strip())
-    else:
-        print("No reflection available.")
-
-def pretty_recommendation(text: Optional[str]) -> None:
-    hr("Action Recommendation")
-    if text:
-        print(text.strip())
-    else:
-        print("No recommendation available.")
-
-def pretty_storage(status: Optional[str], txn_id: str) -> None:
-    hr("Storage")
-    kv("Transaction ID", txn_id)
-    kv("Status", status or "unknown")
-
-def pretty_publish(status: Optional[str], txn_id: str) -> None:
-    hr("Kafka Publishing")
-    kv("Transaction ID", txn_id)
-    kv("Status", status or "unknown")
-
-def pretty_final(state: "WorkflowState") -> None:  # type: ignore
-    hr("Final Summary")
-    kv("Transaction ID", state.transaction.transaction_id)
-    kv("Duplicate", yes_no(state.duplicate_check.get("is_duplicate") if state.duplicate_check else False))
-    kv("Fraud", yes_no(state.fraud_analysis.get("is_fraud") if state.fraud_analysis else False))
-    kv("Similar Cases", len((state.similarity_data or {}).get("similar_cases", [])))
-    kv("Recommendation", state.recommendation or "N/A")
-    kv("Published", yes_no(state.publish_status == "published"))
-    if state.errors:
-        print("\nErrors:")
-        for e in state.errors:
-            print(f"  - {e}")
-
 
 # ---------------------------
 # Pydantic model
@@ -129,7 +40,6 @@ class WorkflowState(BaseModel):
     similarity_data: Optional[Dict[str, Any]] = None
     recommendation: Optional[str] = None
     storage_status: Optional[str] = None
-    publish_status: Optional[str] = None
     errors: List[str] = Field(default_factory=list)  # avoid shared mutable default
     agent_reflection: Optional[str] = None
 
@@ -142,7 +52,6 @@ class WorkflowState(BaseModel):
         return values
 
 def get_db():
-    client = MongoClient(Settings.MONGODB_URI)
     return client[Settings.MONGODB_DATABASE]
 
 async def duplicate_check(state: WorkflowState) -> WorkflowState:
@@ -196,7 +105,6 @@ async def fraud_classification(state: WorkflowState) -> WorkflowState:
 async def similarity_search(state: WorkflowState) -> WorkflowState:
     try:
         loop = asyncio.get_event_loop()
-        encoder = SentenceTransformer(Settings.EMBEDDING_MODEL)
         fs = FraudSignatureService()
         signatures = fs.generate_fraud_signatures(state.transaction)
 
@@ -416,6 +324,7 @@ def build_workflow(checkpointer):
     workflow.add_node("reflect", agent_reflection)
     workflow.add_node("recommend", action_recommendation)
     workflow.add_node("store", store_transaction)
+    workflow.add_node("publish", publish_result)
 
     # Define the workflow
     workflow.set_entry_point("duplicate")
@@ -435,7 +344,8 @@ def build_workflow(checkpointer):
     workflow.add_edge("similarity", "reflect")
     workflow.add_edge("reflect", "recommend")
     workflow.add_edge("recommend", "store")
-    workflow.add_edge("store", END)
+    workflow.add_edge("store", "publish")
+    workflow.add_edge("publish", END)
 
     # Compile with MongoDB checkpointer
     return workflow.compile(checkpointer=checkpointer)
