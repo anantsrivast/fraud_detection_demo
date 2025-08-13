@@ -1,0 +1,11 @@
+{
+    "graphs": {
+        "Agent With Memory": "./agents/agent_with_mem.py:build_workflow",
+        "Agent With Memory Kafka": "./agents/agent_with_mem_kafka.py:build_workflow"
+    },
+    "env": ".env",
+    "python_version": "3.11",
+    "dependencies": [
+        "."
+    ]
+}
