@@ -58,8 +58,6 @@ class CloudKafkaService:
     def create_consumer(self) -> Consumer:
         """Create Confluent Kafka consumer"""
         try:
-            logger.info("🔧 Creating Kafka consumer...")
-            logger.info(f"   Consumer config: {self.consumer_config}")
             
             self.consumer = Consumer(self.consumer_config)
             logger.info("Consumer object created")
@@ -69,15 +67,12 @@ class CloudKafkaService:
             from confluent_kafka import TopicPartition
             
             # Get topic metadata to find available partitions
-            logger.info(f"🔍 Getting topic metadata for: {Settings.KAFKA_TOPIC}")
             metadata = self.consumer.list_topics(Settings.KAFKA_TOPIC)
             topic_metadata = metadata.topics.get(Settings.KAFKA_TOPIC)
             
             if topic_metadata and topic_metadata.partitions:
-                logger.info(f"Found topic with {len(topic_metadata.partitions)} partitions")
                 # Assign to all available partitions
                 partitions = [TopicPartition(Settings.KAFKA_TOPIC, p) for p in topic_metadata.partitions.keys()]
-                logger.info(f"   Partitions to assign: {[p.partition for p in partitions]}")
                 self.consumer.assign(partitions)
                 logger.info(f"Confluent Kafka consumer manually assigned to {len(partitions)} partitions for topic: {Settings.KAFKA_TOPIC}")
             else:
@@ -163,10 +158,8 @@ class CloudKafkaService:
             # Use schema registry serializer if available, otherwise plain JSON
             if self.json_serializer:
                 serialized_data = self.json_serializer(data, None)
-                logger.info(f"Published message to {topic} using Schema Registry")
             else:
                 serialized_data = json.dumps(data).encode('utf-8')
-                logger.info(f"Published message to {topic} using plain JSON")
 
             def delivery_report(err, msg):
                 if err is not None:
@@ -246,8 +239,6 @@ class CloudKafkaService:
                 self.setup_schema_registry()
                 
             logger.info(f"Starting to consume transactions from topic: {Settings.KAFKA_TOPIC}")
-            logger.info(f"Consumer group: {Settings.KAFKA_CONSUMER_GROUP}")
-            logger.info(f"Auto offset reset: earliest")
             
             # Get consumer assignment to verify subscription
             assignment = self.consumer.assignment()
@@ -255,13 +246,7 @@ class CloudKafkaService:
             
             if not assignment:
                 logger.error("No partition assignment - consumer cannot receive messages!")
-                logger.error("This could be due to:")
-                logger.error("  - No messages in the topic")
-                logger.error("  - Consumer group issues")
-                logger.error("  - Topic permissions")
                 return
-            
-            logger.info(f"✅ Consumer assigned to {len(assignment)} partitions")
             
             # Show partition details
             for partition in assignment:
@@ -271,7 +256,6 @@ class CloudKafkaService:
             while True:
                 try:
                     poll_count += 1
-                    logger.info(f"Poll #{poll_count} - waiting for message...")
                     
                     msg = self.consumer.poll(timeout=1.0)
                     
@@ -283,37 +267,24 @@ class CloudKafkaService:
                         logger.error(f"   Poll #{poll_count}: Consumer error: {msg.error()}")
                         continue
                     
-                    logger.info(f"🎉 Poll #{poll_count}: MESSAGE RECEIVED!")
-                    logger.info(f"   Topic: {msg.topic()}")
-                    logger.info(f"   Partition: {msg.partition()}")
-                    logger.info(f"   Offset: {msg.offset()}")
-                    logger.info(f"   Key: {msg.key()}")
-                    logger.info(f"   Message size: {len(msg.value())} bytes")
-                    
                     # Parse message 
                     message_bytes = msg.value()
-                    logger.info(f"   Message bytes: {message_bytes[:20]}... (first 20 bytes)")
 
                     # Parse message using manual Schema Registry format detection
                     # Check if it's a Schema Registry format message
                     if len(message_bytes) >= 5 and message_bytes[0:2] == b'\x00\x00':
-                        logger.info("   Detected Schema Registry format message")
                         # Schema Registry format: [0, 0, schema_id_high, schema_id_low, ...json_data]
                         try:
                             # Extract JSON data (skip the 5-byte header)
                             json_data = message_bytes[5:].decode('utf-8')
-                            logger.info(f"   Extracted JSON data: {json_data[:100]}... (first 100 chars)")
                             transaction_dict = json.loads(json_data)
-                            logger.info("Successfully parsed Schema Registry message manually")
                         except Exception as manual_error:
                             logger.error(f"Manual Schema Registry parsing failed: {manual_error}")
                             continue
                     else:
-                        logger.info("   Detected plain JSON format message")
                         # Try plain JSON deserialization
                         try:
                             transaction_dict = json.loads(msg.value().decode('utf-8'))
-                            logger.info("Deserialized message using plain JSON")
                         except UnicodeDecodeError as decode_error:
                             logger.error(f"Failed to decode message as UTF-8: {decode_error}")
                             logger.error("   Message appears to be binary but not Schema Registry format")
