@@ -14,6 +14,7 @@ from config.settings import Settings
 from config.logger import get_logger
 from datetime import datetime
 import time
+import json
 
 logger = get_logger(__name__)
 
@@ -497,50 +498,13 @@ async def process_transaction_from_kafka(transaction: Transaction, compiled_work
         logger.error(f"Error processing transaction {transaction.transaction_id}: {e}")
         return None
 
-def kafka_transaction_callback(transaction: Transaction, compiled_workflow):
-    """Callback function for Kafka consumer to process transactions with checkpointing"""
+async def kafka_transaction_callback(transaction: Transaction, compiled_workflow):
+    """Async callback function for Kafka consumer to process transactions with checkpointing"""
     try:
         print(f"\nProcessing transaction from Kafka: {transaction.transaction_id}")
         print(f"{'='*60}")
         
-        import concurrent.futures
-        
-        def run_workflow_sync():
-            try:
-                # Create a new event loop for this thread
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                # Create a completely fresh workflow for this transaction
-                async def run_fresh_workflow():
-                    from langgraph.checkpoint.mongodb import AsyncMongoDBSaver
-                    
-                    # Create a fresh MongoDB connection and workflow
-                    async with AsyncMongoDBSaver.from_conn_string(
-                        conn_string=Settings.MONGODB_URI,
-                        db_name=Settings.MONGODB_DATABASE,
-                        collection_name="langgraph_checkpoints"
-                    ) as checkpointer:
-                        workflow = build_workflow(checkpointer)
-                        return await process_transaction_from_kafka(transaction, workflow)
-                
-                # Run the fresh workflow
-                result = loop.run_until_complete(run_fresh_workflow())
-                return result
-                
-            except Exception as e:
-                print(f"Error in workflow thread: {e}")
-                return None
-            finally:
-                try:
-                    loop.close()
-                except:
-                    pass
-        
-        # Run the workflow in a thread pool to get the result
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_workflow_sync)
-            result = future.result()  # This will block until the workflow completes
+        result = await process_transaction_from_kafka(transaction, compiled_workflow)
         
         if result:
             print(f"Workflow completed successfully for transaction: {transaction.transaction_id}")
@@ -550,6 +514,80 @@ def kafka_transaction_callback(transaction: Transaction, compiled_workflow):
     except Exception as e:
         logger.error(f"Error in Kafka callback: {e}")
         print(f"Kafka callback error: {e}")
+
+async def consume_transactions_async(kafka_service, compiled_workflow):
+    """Async version of consume_transactions that processes messages asynchronously"""
+    try:
+        if not kafka_service.consumer:
+            kafka_service.create_consumer()
+        
+        # Setup schema registry if not already done
+        if not kafka_service.schema_registry_client:
+            kafka_service.setup_schema_registry()
+ 
+        poll_count = 0
+        while True:
+            try:
+                poll_count += 1
+                logger.info(f"Poll #{poll_count} - waiting for message...")
+                
+                msg = kafka_service.consumer.poll(timeout=1.0)
+                
+                if msg is None:
+                    logger.info(f"   Poll #{poll_count}: No message received")
+                    continue
+                
+                if msg.error():
+                    logger.error(f"   Poll #{poll_count}: Consumer error: {msg.error()}")
+                    continue
+                
+                # Parse message 
+                message_bytes = msg.value()
+                logger.info(f"   Message bytes: {message_bytes[:20]}... (first 20 bytes)")
+
+                # Parse message using manual Schema Registry format detection
+                # Check if it's a Schema Registry format message
+                if len(message_bytes) >= 5 and message_bytes[0:2] == b'\x00\x00':
+                    # Schema Registry format: [0, 0, schema_id_high, schema_id_low, ...json_data]
+                    try:
+                        # Extract JSON data (skip the 5-byte header)
+                        json_data = message_bytes[5:].decode('utf-8')
+                        transaction_dict = json.loads(json_data)
+                    except Exception as manual_error:
+                        logger.error(f"Manual Schema Registry parsing failed: {manual_error}")
+                        continue
+                else:
+                    # Try plain JSON deserialization
+                    try:
+                        transaction_dict = json.loads(msg.value().decode('utf-8'))
+                    except UnicodeDecodeError as decode_error:
+                        logger.error(f"Failed to decode message as UTF-8: {decode_error}")
+                        logger.error("   Message appears to be binary but not Schema Registry format")
+                        continue
+                    except json.JSONDecodeError as json_error:
+                        logger.error(f"Failed to parse JSON: {json_error}")
+                        continue
+                
+                try:
+                    transaction = Transaction(**transaction_dict)
+                    
+                    # Process transaction asynchronously
+                    await kafka_transaction_callback(transaction, compiled_workflow)
+                except Exception as transaction_error:
+                    logger.error(f"Failed to create Transaction object: {transaction_error}")
+                    logger.error(f"   Transaction dict: {transaction_dict}")
+                    continue
+                
+            except KeyboardInterrupt:
+                logger.info("Received keyboard interrupt, shutting down...")
+                break
+            except Exception as e:
+                logger.error(f"Error in message processing loop: {e}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"Error in async consumer: {e}")
+        raise
 
 async def main():
     """Main execution function using async context manager with Kafka consumption"""
@@ -575,12 +613,8 @@ async def main():
             print(f"Listening on topic: {Settings.KAFKA_TOPIC}")
             print("Press Ctrl+C to stop...")
             
-            # Create a callback function that includes the compiled workflow
-            def callback_with_workflow(transaction: Transaction):
-                kafka_transaction_callback(transaction, compiled_workflow)
-            
-            # Start consuming transactions from Kafka
-            kafka_service.consume_transactions(callback_with_workflow)
+            # Start consuming transactions from Kafka asynchronously
+            await consume_transactions_async(kafka_service, compiled_workflow)
             
         except KeyboardInterrupt:
             print("\nShutting down...")
